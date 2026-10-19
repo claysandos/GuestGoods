@@ -23,14 +23,17 @@ class Item {
 class DB {
   static Database? _db;
   static Future<Database> get db async => _db ??= await openDatabase(
-        join(await getDatabasesPath(), 'guestgoods.db'),
-        version: 1,
-        onCreate: (d, v) async {
-          await d.execute('CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, cost REAL, price REAL, qty INTEGER, reorder INTEGER)');
-          await d.execute('CREATE TABLE sales(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER)');
-          await d.execute('CREATE TABLE sale_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, item_name TEXT, qty INTEGER, price REAL, cost REAL)');
-        },
-      );
+    join(await getDatabasesPath(), 'guestgoods.db'),
+    version: 2,
+    onCreate: (d, v) async {
+      await d.execute('CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, cost REAL, price REAL, qty INTEGER, reorder INTEGER)');
+      await d.execute('CREATE TABLE sales(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER)');
+      await d.execute('CREATE TABLE sale_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, item_name TEXT, qty INTEGER, price REAL, cost REAL, item_id INTEGER)');
+    },
+    onUpgrade: (d, oldV, newV) async {
+      if (oldV < 2) await d.execute('ALTER TABLE sale_lines ADD COLUMN item_id INTEGER');
+    },
+  );
 
   static Future<List<Item>> items() async =>
       (await (await db).query('items', orderBy: 'name COLLATE NOCASE')).map(Item.fromMap).toList();
@@ -52,9 +55,65 @@ class DB {
     await d.transaction((t) async {
       final sid = await t.insert('sales', {'ts': DateTime.now().millisecondsSinceEpoch});
       for (final e in cart.entries) {
-        await t.insert('sale_lines', {'sale_id': sid, 'item_name': e.key.name, 'qty': e.value, 'price': e.key.price, 'cost': e.key.cost});
+        await t.insert('sale_lines', {'sale_id': sid, 'item_id': e.key.id, 'item_name': e.key.name, 'qty': e.value, 'price': e.key.price, 'cost': e.key.cost});
         await t.rawUpdate('UPDATE items SET qty = qty - ? WHERE id = ?', [e.value, e.key.id]);
       }
+    });
+  }
+
+  static Future<List<Map<String, Object?>>> recentSales({int limit = 15}) async => (await db).rawQuery(
+      "SELECT s.id, s.ts, SUM(l.qty * l.price) AS total, GROUP_CONCAT(l.item_name || ' × ' || l.qty, ', ') AS summary "
+          'FROM sales s JOIN sale_lines l ON l.sale_id = s.id GROUP BY s.id ORDER BY s.ts DESC LIMIT ?',
+      [limit]);
+
+  static Future<List<Map<String, Object?>>> saleLines(int saleId) async =>
+      (await db).query('sale_lines', where: 'sale_id=?', whereArgs: [saleId], orderBy: 'id');
+
+  // Puts units back in stock (n > 0) or takes them out (n < 0). Matches by item id, falling back to name for older sales.
+  static Future<void> _restock(DatabaseExecutor t, Map<String, Object?> l, int n) async {
+    if (l['item_id'] != null) {
+      await t.rawUpdate('UPDATE items SET qty = qty + ? WHERE id = ?', [n, l['item_id']]);
+    } else {
+      await t.rawUpdate('UPDATE items SET qty = qty + ? WHERE LOWER(name) = ?', [n, (l['item_name'] as String).toLowerCase()]);
+    }
+  }
+
+  /// Undo a whole sale: returns all its items to stock and deletes it.
+  static Future<void> undoSale(int saleId) async {
+    final d = await db;
+    await d.transaction((t) async {
+      for (final l in await t.query('sale_lines', where: 'sale_id=?', whereArgs: [saleId])) {
+        await _restock(t, l, l['qty'] as int);
+      }
+      await t.delete('sale_lines', where: 'sale_id=?', whereArgs: [saleId]);
+      await t.delete('sales', where: 'id=?', whereArgs: [saleId]);
+    });
+  }
+
+  /// Change quantities on a sale (keyed by sale_lines.id). Stock is adjusted by the difference.
+  /// A sale whose lines all reach zero is deleted. Throws StateError if stock can't cover an increase.
+  static Future<void> updateSale(int saleId, Map<int, int> newQty) async {
+    final d = await db;
+    await d.transaction((t) async {
+      for (final l in await t.query('sale_lines', where: 'sale_id=?', whereArgs: [saleId])) {
+        final old = l['qty'] as int, nq = newQty[l['id'] as int] ?? old;
+        if (nq == old) continue;
+        if (nq > old) {
+          final r = await t.query('items',
+              columns: ['qty'],
+              where: l['item_id'] != null ? 'id=?' : 'LOWER(name)=?',
+              whereArgs: [l['item_id'] ?? (l['item_name'] as String).toLowerCase()]);
+          if (r.isEmpty || (r.first['qty'] as int) < nq - old) throw StateError('Not enough stock for ${l['item_name']}');
+        }
+        await _restock(t, l, old - nq);
+        if (nq <= 0) {
+          await t.delete('sale_lines', where: 'id=?', whereArgs: [l['id']]);
+        } else {
+          await t.update('sale_lines', {'qty': nq}, where: 'id=?', whereArgs: [l['id']]);
+        }
+      }
+      final left = Sqflite.firstIntValue(await t.rawQuery('SELECT COUNT(*) FROM sale_lines WHERE sale_id=?', [saleId])) ?? 0;
+      if (left == 0) await t.delete('sales', where: 'id=?', whereArgs: [saleId]);
     });
   }
 
