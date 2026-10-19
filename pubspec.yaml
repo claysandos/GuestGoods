@@ -1,0 +1,21 @@
+name: guestgoods
+description: Hotel gift shop sales, inventory and monthly reports.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sqflite: ^2.3.3
+  path: ^1.9.0
+  intl: ^0.19.0
+  image_picker: ^1.1.2
+  google_mlkit_text_recognition: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
